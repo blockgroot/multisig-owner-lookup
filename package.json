@@ -14,7 +14,8 @@
   "version": "1.0.0",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc",
+    "build": "echo 'No build needed for Vercel - static files in public/ and API routes in api/'",
+    "build:cli": "tsc",
     "start": "node dist/index.js",
     "dev": "ts-node src/index.ts"
   },
