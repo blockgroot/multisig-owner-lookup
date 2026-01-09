@@ -41,12 +41,18 @@ npm run dev <wallet-address>
    - Click "New Project"
    - Import your GitHub repository
 
-3. Add Environment Variable:
+3. **Configure Build Settings** (IMPORTANT):
+   - Framework Preset: "Other" or leave as default
+   - **Build Command**: Leave **EMPTY** (no build needed for static files)
+   - **Output Directory**: Leave **EMPTY** (Vercel will auto-detect `public/` folder)
+   - Root Directory: `./` (root)
+
+4. Add Environment Variable:
    - In your Vercel project settings, go to "Environment Variables"
    - Add `SAFE_API_KEY` with your API key value
    - Make sure it's available for Production, Preview, and Development
 
-4. Deploy:
+5. Deploy:
    - Vercel will automatically deploy when you push to your main branch
    - Or click "Deploy" in the Vercel dashboard
 
