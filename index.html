@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Safe Multisig Lookup</title>
+</head>
+<body>
+    <h1>Safe Multisig Lookup</h1>
+    <form id="lookupForm">
+        <input type="text" id="addressInput" placeholder="Enter wallet address (0x...)" required style="width: 400px; padding: 8px;">
+        <button type="submit" id="submitBtn">Lookup</button>
+    </form>
+    <div id="loading" style="display: none; margin-top: 20px;">Loading...</div>
+    <div id="results" style="margin-top: 20px;"></div>
+
+    <script>
+        const form = document.getElementById('lookupForm');
+        const addressInput = document.getElementById('addressInput');
+        const submitBtn = document.getElementById('submitBtn');
+        const loading = document.getElementById('loading');
+        const results = document.getElementById('results');
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const address = addressInput.value.trim();
+            
+            if (!address) {
+                alert('Please enter a wallet address');
+                return;
+            }
+
+            // Show loading state
+            loading.style.display = 'block';
+            results.innerHTML = '';
+            submitBtn.disabled = true;
+
+            try {
+                const response = await fetch(`/api/lookup?address=${encodeURIComponent(address)}`);
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.error || 'Failed to fetch data');
+                }
+
+                // Display results
+                if (Object.keys(data.safes).length === 0) {
+                    results.innerHTML = '<p>No Safe multisigs found for this address.</p>';
+                } else {
+                    let html = '<h2>Results:</h2>';
+                    for (const [network, safeList] of Object.entries(data.safes)) {
+                        html += `<h3>${network.toUpperCase()}</h3>`;
+                        html += '<ul>';
+                        safeList.forEach((safe) => {
+                            html += `<li>${safe}</li>`;
+                        });
+                        html += '</ul>';
+                    }
+                    results.innerHTML = html;
+                }
+            } catch (error) {
+                results.innerHTML = `<p style="color: red;">Error: ${error.message}</p>`;
+            } finally {
+                loading.style.display = 'none';
+                submitBtn.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>
