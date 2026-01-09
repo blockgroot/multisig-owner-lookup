@@ -15,3 +15,34 @@ export interface OwnerSafesResponse {
   previous: string | null;
   results: SafeInfo[];
 }
+
+export interface SafeDetailsResponse {
+  address: string;
+  nonce: number;
+  threshold: number;
+  owners: string[];
+  masterCopy: string;
+  modules: string[];
+  fallbackHandler: string;
+  guard: string | null;
+  version: string;
+}
+
+export interface OwnerWithName {
+  address: string;
+  name: string | null;
+}
+
+export interface SafeWithThreshold {
+  address: string;
+  threshold: number;
+  totalOwners: number;
+  name: string | null;
+}
+
+export interface SafeOwnersWithThreshold {
+  safeAddress: string;
+  safeName: string | null;
+  owners: OwnerWithName[];
+  threshold: number;
+}

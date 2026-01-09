@@ -1,0 +1,1427 @@
+diff --git a/.gitignore b/.gitignore
+index aa0926a..58d99e3 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,3 +2,4 @@ node_modules/
+ dist/
+ .env
+ *.log
++.vercel
+diff --git a/README.md b/README.md
+index 4e8a1e8..3848c61 100644
+--- a/README.md
++++ b/README.md
+@@ -1,11 +1,13 @@
+ # Safe Multisig Lookup
+ 
+-A simple tool to lookup Safe multisig wallets by owner address across multiple networks.
++A tool to lookup Safe multisig wallets and their owners across multiple networks.
+ 
+ ## Features
+ 
+-- Lookup Safe multisigs across Ethereum, Polygon, Arbitrum, Optimism, Base, Gnosis, and BNB networks
+-- Simple web interface
++- **Owner Lookup**: Find all Safe multisigs where a given address is an owner
++- **Safe Lookup**: Find all owners of a given Safe address with name mapping from address book
++- Supports Ethereum, Polygon, Arbitrum, Optimism, BNB, Gnosis, and xLayer Chain networks
++- Simple web interface with toggle between lookup modes
+ - CLI tool for command-line usage
+ 
+ ## Local Development
+@@ -29,7 +31,11 @@ SAFE_API_KEY=your_api_key_here
+ 
+ 3. Run the CLI tool:
+ ```bash
+-npm run dev <wallet-address>
++# Owner lookup - find all Safes owned by an address
++npm run dev owner <wallet-address>
++
++# Safe lookup - find all owners of a Safe address
++npm run dev safe <safe-address>
+ ```
+ 
+ ## Deployment to Vercel
+diff --git a/api/lookup.ts b/api/lookup.ts
+index 0151014..d8e2229 100644
+--- a/api/lookup.ts
++++ b/api/lookup.ts
+@@ -1,21 +1,25 @@
+ import type { VercelRequest, VercelResponse } from '@vercel/node';
+ import axios from "axios";
+ import { getAddress } from "ethers";
+-import { SAFE_NETWORKS } from "../src/networks";
+-import { OwnerSafesResponse } from "../src/types";
++import { SAFE_NETWORKS, NETWORK_TO_CHAIN_ID, NETWORK_TO_SAFE_APP } from "../src/networks";
++import { OwnerSafesResponse, SafeDetailsResponse, SafeWithThreshold, SafeOwnersWithThreshold } from "../src/types";
++import { ADDRESS_BOOK_INDEX } from "../safe-address-book-2026-01-13";
+ 
+ const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+ 
+-async function fetchWithRetry(
++async function fetchWithRetry<T>(
+   url: string,
+   headers: Record<string, string>,
+   maxRetries: number = 3
+-): Promise<OwnerSafesResponse> {
++): Promise<T> {
+   for (let attempt = 1; attempt <= maxRetries; attempt++) {
+     try {
+-      const response = await axios.get<OwnerSafesResponse>(url, { headers });
++      const response = await axios.get<T>(url, { headers });
+       return response.data;
+     } catch (error: any) {
++      if (error.response?.status === 404) {
++        throw error;
++      }
+       if (attempt === maxRetries) {
+         throw error;
+       }
+@@ -27,7 +31,7 @@ async function fetchWithRetry(
+ 
+ async function getSafesByOwner(owner: string) {
+   const normalizedOwner = getAddress(owner);
+-  const result: Record<string, string[]> = {};
++  const result: Record<string, SafeWithThreshold[]> = {};
+   const apiKey = process.env.SAFE_API_KEY;
+ 
+   if (!apiKey) {
+@@ -37,18 +41,91 @@ async function getSafesByOwner(owner: string) {
+   for (const [network, baseUrl] of Object.entries(SAFE_NETWORKS)) {
+     try {
+       const url = `${baseUrl}/api/v2/owners/${normalizedOwner}/safes/`; 
+-      const data = await fetchWithRetry(url, {
++      const data = await fetchWithRetry<OwnerSafesResponse>(url, {
+         "Authorization": `Bearer ${apiKey}`
+       });
+ 
+       if (data.results && data.results.length > 0) {
+-        result[network] = data.results.map(safe => safe.address);
++        const chainId = NETWORK_TO_CHAIN_ID[network];
++        const addressBook = ADDRESS_BOOK_INDEX[chainId] || {};
++        
++        result[network] = data.results.map(safe => {
++          const normalizedSafe = safe.address.toLowerCase();
++          const safeName = addressBook[normalizedSafe] || null;
++          return {
++            address: safe.address,
++            threshold: safe.threshold,
++            totalOwners: safe.owners.length,
++            name: safeName
++          };
++        });
++      }
++    } catch (error: any) {
++      // Only log non-404 errors (404 means no safes found, which is normal)
++      if (error.response?.status !== 404) {
++        console.error(`❌ ${network}: ${error.message}`);
++      }
++    }
++  }
++
++  return result;
++}
++
++async function getOwnersBySafe(safeAddress: string) {
++  const normalizedSafe = getAddress(safeAddress);
++  const result: Record<string, SafeOwnersWithThreshold> = {};
++  const apiKey = process.env.SAFE_API_KEY;
++
++  if (!apiKey) {
++    throw new Error("SAFE_API_KEY is not set");
++  }
++
++  const networks = Object.keys(SAFE_NETWORKS);
++  console.log(`Searching Safe ${normalizedSafe} across ${networks.length} networks: ${networks.join(', ')}`);
++
++  for (const [network, baseUrl] of Object.entries(SAFE_NETWORKS)) {
++    try {
++      console.log(`Checking ${network}...`);
++      const url = `${baseUrl}/api/v1/safes/${normalizedSafe}/`;
++      const data = await fetchWithRetry<SafeDetailsResponse>(url, {
++        "Authorization": `Bearer ${apiKey}`
++      });
++
++      if (data.owners && data.owners.length > 0) {
++        console.log(`✓ Found Safe on ${network} with ${data.owners.length} owners`);
++        const chainId = NETWORK_TO_CHAIN_ID[network];
++        const addressBook = ADDRESS_BOOK_INDEX[chainId] || {};
++        
++        const normalizedSafeAddr = normalizedSafe.toLowerCase();
++        const safeName = addressBook[normalizedSafeAddr] || null;
++        
++        result[network] = {
++          safeAddress: normalizedSafe,
++          safeName: safeName,
++          threshold: data.threshold,
++          owners: data.owners.map(owner => {
++            const normalizedOwner = owner.toLowerCase();
++            const name = addressBook[normalizedOwner] || null;
++            return {
++              address: owner,
++              name: name
++            };
++          })
++        };
++      } else {
++        console.log(`- No owners found on ${network}`);
+       }
+     } catch (error: any) {
+-      console.error(`❌ ${network}: ${error.message}`);
++      // Only log non-404 errors (404 means Safe doesn't exist on this network, which is normal)
++      if (error.response?.status === 404) {
++        console.log(`- Safe not found on ${network} (404)`);
++      } else {
++        console.error(`❌ ${network}: ${error.message}`);
++      }
+     }
+   }
+ 
++  console.log(`Search complete. Found on ${Object.keys(result).length} network(s): ${Object.keys(result).join(', ')}`);
+   return result;
+ }
+ 
+@@ -71,15 +148,22 @@ export default async function handler(
+     return response.status(405).json({ error: 'Method not allowed' });
+   }
+ 
+-  const { address } = request.query;
++  const { address, type } = request.query;
+ 
+   if (!address || typeof address !== 'string') {
+     return response.status(400).json({ error: 'Address parameter is required' });
+   }
+ 
++  const lookupType = type === 'safe' ? 'safe' : 'owner';
++
+   try {
+-    const safes = await getSafesByOwner(address);
+-    return response.status(200).json({ safes });
++    if (lookupType === 'safe') {
++      const owners = await getOwnersBySafe(address);
++      return response.status(200).json({ owners });
++    } else {
++      const safes = await getSafesByOwner(address);
++      return response.status(200).json({ safes });
++    }
+   } catch (error: any) {
+     console.error('Error:', error);
+     return response.status(500).json({ error: error.message || 'Internal server error' });
+diff --git a/csv-to-addressbook.ts b/csv-to-addressbook.ts
+new file mode 100644
+index 0000000..e3be71c
+--- /dev/null
++++ b/csv-to-addressbook.ts
+@@ -0,0 +1,109 @@
++import fs from "fs";
++import path from "path";
++
++type AddressBookEntry = {
++  address: string;
++  name: string;
++  chainId: number;
++};
++
++function parseCSV(csv: string): AddressBookEntry[] {
++  const lines = csv.trim().split("\n");
++  const header = lines.shift(); // remove header
++
++  if (!header?.toLowerCase().includes("address")) {
++    throw new Error("CSV must start with: address,name,chainId");
++  }
++
++  const rows: AddressBookEntry[] = [];
++
++  for (const line of lines) {
++    if (!line.trim()) continue;
++
++    const [address, name, chainIdRaw] = line.split(",");
++
++    if (!address || !name || !chainIdRaw) continue;
++
++    rows.push({
++      address: address.trim(),
++      name: name.trim(),
++      chainId: Number(chainIdRaw.trim()),
++    });
++  }
++
++  return rows;
++}
++
++function normalize(entries: AddressBookEntry[]): AddressBookEntry[] {
++  const seen = new Set<string>();
++  const out: AddressBookEntry[] = [];
++
++  for (const e of entries) {
++    const key = `${e.address.toLowerCase()}-${e.chainId}`;
++    if (seen.has(key)) continue;
++
++    seen.add(key);
++
++    out.push({
++      address: e.address,
++      name: e.name,
++      chainId: e.chainId,
++    });
++  }
++
++  return out;
++}
++
++function generateTS(entries: AddressBookEntry[]): string {
++  const rows = entries
++    .map(
++      (e) =>
++        `  { address: "${e.address}", name: "${e.name}", chainId: ${e.chainId} },`
++    )
++    .join("\n");
++
++  return `
++// AUTO-GENERATED FILE — DO NOT EDIT
++
++export type AddressBookEntry = {
++  address: string;
++  name: string;
++  chainId: number;
++};
++
++export const ADDRESS_BOOK: AddressBookEntry[] = [
++${rows}
++];
++
++export const ADDRESS_BOOK_INDEX: Record<number, Record<string, string>> = (() => {
++  const index: Record<number, Record<string, string>> = {};
++  for (const e of ADDRESS_BOOK) {
++    const addr = e.address.toLowerCase();
++    if (!index[e.chainId]) index[e.chainId] = {};
++    index[e.chainId][addr] = e.name;
++  }
++  return index;
++})();
++`;
++}
++
++function main() {
++  const file = process.argv[2];
++
++  if (!file) {
++    console.error("Usage: ts-node csv-to-addressbook.ts <file.csv>");
++    process.exit(1);
++  }
++
++  const csv = fs.readFileSync(file, "utf8");
++  const parsed = parseCSV(csv);
++  const normalized = normalize(parsed);
++  const ts = generateTS(normalized);
++
++  const out = path.basename(file).replace(".csv", ".ts");
++  fs.writeFileSync(out, ts);
++
++  console.log(`Generated ${out}`);
++}
++
++main();
+diff --git a/index.html b/index.html
+index d651ab5..f9371ee 100644
+--- a/index.html
++++ b/index.html
+@@ -4,15 +4,127 @@
+     <meta charset="UTF-8">
+     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+     <title>Safe Multisig Lookup</title>
++    <style>
++        body {
++            font-family: Arial, sans-serif;
++            max-width: 800px;
++            margin: 50px auto;
++            padding: 20px;
++        }
++        .lookup-type {
++            margin-bottom: 15px;
++        }
++        .lookup-type label {
++            margin-right: 20px;
++            cursor: pointer;
++        }
++        .lookup-type input[type="radio"] {
++            margin-right: 5px;
++        }
++        #addressInput {
++            width: 400px;
++            padding: 8px;
++            margin-bottom: 10px;
++        }
++        #submitBtn {
++            padding: 8px 20px;
++            cursor: pointer;
++        }
++        #submitBtn:disabled {
++            opacity: 0.6;
++            cursor: not-allowed;
++        }
++        #loading {
++            margin-top: 20px;
++            font-style: italic;
++        }
++        #results {
++            margin-top: 20px;
++        }
++        #results h2 {
++            margin-top: 20px;
++        }
++        #results h3 {
++            margin-top: 15px;
++            color: #333;
++        }
++        #results ul {
++            list-style-type: none;
++            padding-left: 0;
++        }
++        #results li {
++            padding: 5px 0;
++            font-family: monospace;
++        }
++        .owner-name {
++            color: #666;
++            font-style: italic;
++        }
++        .threshold {
++            color: #0066cc;
++            font-weight: bold;
++            margin-left: 10px;
++        }
++        .safe-link {
++            color: #0066cc;
++            text-decoration: none;
++            margin-left: 10px;
++            font-size: 0.9em;
++        }
++        .safe-link:hover {
++            text-decoration: underline;
++        }
++        .copy-btn {
++            background-color: #f0f0f0;
++            border: 1px solid #ccc;
++            border-radius: 3px;
++            padding: 2px 8px;
++            margin-left: 8px;
++            cursor: pointer;
++            font-size: 0.85em;
++            color: #666;
++        }
++        .copy-btn:hover {
++            background-color: #e0e0e0;
++            color: #333;
++        }
++        .copy-btn:active {
++            background-color: #d0d0d0;
++        }
++        .address-container {
++            display: flex;
++            align-items: center;
++            gap: 5px;
++        }
++        .safe-name {
++            color: #0066cc;
++            font-weight: bold;
++            margin-left: 5px;
++        }
++    </style>
+ </head>
+ <body>
+     <h1>Safe Multisig Lookup</h1>
+     <form id="lookupForm">
+-        <input type="text" id="addressInput" placeholder="Enter wallet address (0x...)" required style="width: 400px; padding: 8px;">
+-        <button type="submit" id="submitBtn">Lookup</button>
++        <div class="lookup-type">
++            <label>
++                <input type="radio" name="lookupType" value="owner" checked>
++                Find Safes by Owner Address
++            </label>
++            <label>
++                <input type="radio" name="lookupType" value="safe">
++                Find Owners by Safe Address
++            </label>
++        </div>
++        <div>
++            <input type="text" id="addressInput" placeholder="Enter address (0x...)" required>
++        </div>
++        <div>
++            <button type="submit" id="submitBtn">Lookup</button>
++        </div>
+     </form>
+-    <div id="loading" style="display: none; margin-top: 20px;">Loading...</div>
+-    <div id="results" style="margin-top: 20px;"></div>
++    <div id="loading" style="display: none;">Loading...</div>
++    <div id="results"></div>
+ 
+     <script>
+         const form = document.getElementById('lookupForm');
+@@ -20,13 +132,69 @@
+         const submitBtn = document.getElementById('submitBtn');
+         const loading = document.getElementById('loading');
+         const results = document.getElementById('results');
++        const lookupTypeRadios = document.querySelectorAll('input[name="lookupType"]');
++
++        // Network to Safe app URL prefix mapping
++        const NETWORK_TO_SAFE_APP = {
++            ethereum: 'eth',
++            polygon: 'matic',
++            optimism: 'oeth',
++            bnb: 'bnb',
++            arbitrum: 'arb1',
++            gnosis: 'gno',
++            xlaychain: 'okb'
++        };
++
++        // Function to clear results
++        function clearResults() {
++            results.innerHTML = '';
++            loading.style.display = 'none';
++        }
++
++        // Function to copy address to clipboard (global for onclick)
++        window.copyToClipboard = function(text, event) {
++            navigator.clipboard.writeText(text).then(() => {
++                // Show temporary feedback
++                const btn = event.target;
++                const originalText = btn.textContent;
++                btn.textContent = 'Copied!';
++                btn.style.backgroundColor = '#4CAF50';
++                btn.style.color = 'white';
++                setTimeout(() => {
++                    btn.textContent = originalText;
++                    btn.style.backgroundColor = '';
++                    btn.style.color = '';
++                }, 1000);
++            }).catch(err => {
++                console.error('Failed to copy:', err);
++                alert('Failed to copy address');
++            });
++        }
++
++        // Update placeholder and clear results when lookup type changes
++        lookupTypeRadios.forEach(radio => {
++            radio.addEventListener('change', () => {
++                if (radio.value === 'owner') {
++                    addressInput.placeholder = 'Enter owner wallet address (0x...)';
++                } else {
++                    addressInput.placeholder = 'Enter Safe address (0x...)';
++                }
++                clearResults();
++            });
++        });
++
++        // Clear results when address input changes
++        addressInput.addEventListener('input', () => {
++            clearResults();
++        });
+ 
+         form.addEventListener('submit', async (e) => {
+             e.preventDefault();
+             const address = addressInput.value.trim();
++            const lookupType = document.querySelector('input[name="lookupType"]:checked').value;
+             
+             if (!address) {
+-                alert('Please enter a wallet address');
++                alert('Please enter an address');
+                 return;
+             }
+ 
+@@ -36,7 +204,8 @@
+             submitBtn.disabled = true;
+ 
+             try {
+-                const response = await fetch(`/api/lookup?address=${encodeURIComponent(address)}`);
++                const url = `/api/lookup?address=${encodeURIComponent(address)}&type=${lookupType}`;
++                const response = await fetch(url);
+                 const data = await response.json();
+ 
+                 if (!response.ok) {
+@@ -44,19 +213,54 @@
+                 }
+ 
+                 // Display results
+-                if (Object.keys(data.safes).length === 0) {
+-                    results.innerHTML = '<p>No Safe multisigs found for this address.</p>';
++                if (lookupType === 'owner') {
++                    // Owner lookup - show Safe addresses with threshold
++                    if (Object.keys(data.safes || {}).length === 0) {
++                        results.innerHTML = '<p>No Safe multisigs found for this owner address.</p>';
++                    } else {
++                        let html = '<h2>Safe Multisigs Found:</h2>';
++                        for (const [network, safeList] of Object.entries(data.safes)) {
++                            html += `<h3>${network.toUpperCase()}</h3>`;
++                            html += '<ul>';
++                            safeList.forEach((safe) => {
++                                const safeAppUrl = `https://app.safe.global/home?safe=${NETWORK_TO_SAFE_APP[network]}:${safe.address}`;
++                                const nameDisplay = safe.name ? `<span class="safe-name">(${safe.name})</span>` : '';
++                                html += `<li class="address-container">`;
++                                html += `<a href="${safeAppUrl}" target="_blank" class="safe-link">${safe.address}</a>`;
++                                html += `<span class="threshold">(Threshold: ${safe.threshold}/${safe.totalOwners})</span>`;
++                                html += nameDisplay;
++                                html += `</li>`;
++                            });
++                            html += '</ul>';
++                        }
++                        results.innerHTML = html;
++                    }
+                 } else {
+-                    let html = '<h2>Results:</h2>';
+-                    for (const [network, safeList] of Object.entries(data.safes)) {
+-                        html += `<h3>${network.toUpperCase()}</h3>`;
+-                        html += '<ul>';
+-                        safeList.forEach((safe) => {
+-                            html += `<li>${safe}</li>`;
+-                        });
+-                        html += '</ul>';
++                    // Safe lookup - show owners with names and threshold
++                    if (Object.keys(data.owners || {}).length === 0) {
++                        results.innerHTML = '<p>No owners found for this Safe address on any network.</p>';
++                    } else {
++                        let html = '<h2>Owners Found:</h2>';
++                        for (const [network, safeData] of Object.entries(data.owners)) {
++                            const safeNameDisplay = safeData.safeName 
++                                ? ` <span class="safe-name">(${safeData.safeName})</span>` 
++                                : '';
++                            const safeAppUrl = `https://app.safe.global/home?safe=${NETWORK_TO_SAFE_APP[network]}:${safeData.safeAddress}`;
++                            html += `<h3>${network.toUpperCase()} - Safe: <a href="${safeAppUrl}" target="_blank" class="safe-link">${safeData.safeAddress}</a>${safeNameDisplay} <span class="threshold">(Threshold: ${safeData.threshold}/${safeData.owners.length})</span></h3>`;
++                            html += '<ul>';
++                            safeData.owners.forEach((owner) => {
++                                const nameDisplay = owner.name 
++                                    ? ` <span class="owner-name">(${owner.name})</span>` 
++                                    : '';
++                                html += `<li class="address-container">`;
++                                html += `<span>${owner.address}${nameDisplay}</span>`;
++                                html += `<button class="copy-btn" onclick="copyToClipboard('${owner.address}', event)">Copy</button>`;
++                                html += `</li>`;
++                            });
++                            html += '</ul>';
++                        }
++                        results.innerHTML = html;
+                     }
+-                    results.innerHTML = html;
+                 }
+             } catch (error) {
+                 results.innerHTML = `<p style="color: red;">Error: ${error.message}</p>`;
+diff --git a/package.json b/package.json
+index d65bf59..58035b1 100644
+--- a/package.json
++++ b/package.json
+@@ -17,7 +17,9 @@
+     "build": "mkdir -p public && [ -f public/index.html ] && echo '✓ public/index.html exists' || (echo '✗ public/index.html missing' && exit 1)",
+     "build:cli": "tsc",
+     "start": "node dist/index.js",
+-    "dev": "ts-node src/index.ts"
++    "dev": "ts-node src/index.ts",
++    "dev:server": "vercel dev",
++    "dev:static": "npx http-server . -p 3000 -o"
+   },
+   "keywords": [],
+   "author": "",
+diff --git a/public/index.html b/public/index.html
+index d651ab5..f9371ee 100644
+--- a/public/index.html
++++ b/public/index.html
+@@ -4,15 +4,127 @@
+     <meta charset="UTF-8">
+     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+     <title>Safe Multisig Lookup</title>
++    <style>
++        body {
++            font-family: Arial, sans-serif;
++            max-width: 800px;
++            margin: 50px auto;
++            padding: 20px;
++        }
++        .lookup-type {
++            margin-bottom: 15px;
++        }
++        .lookup-type label {
++            margin-right: 20px;
++            cursor: pointer;
++        }
++        .lookup-type input[type="radio"] {
++            margin-right: 5px;
++        }
++        #addressInput {
++            width: 400px;
++            padding: 8px;
++            margin-bottom: 10px;
++        }
++        #submitBtn {
++            padding: 8px 20px;
++            cursor: pointer;
++        }
++        #submitBtn:disabled {
++            opacity: 0.6;
++            cursor: not-allowed;
++        }
++        #loading {
++            margin-top: 20px;
++            font-style: italic;
++        }
++        #results {
++            margin-top: 20px;
++        }
++        #results h2 {
++            margin-top: 20px;
++        }
++        #results h3 {
++            margin-top: 15px;
++            color: #333;
++        }
++        #results ul {
++            list-style-type: none;
++            padding-left: 0;
++        }
++        #results li {
++            padding: 5px 0;
++            font-family: monospace;
++        }
++        .owner-name {
++            color: #666;
++            font-style: italic;
++        }
++        .threshold {
++            color: #0066cc;
++            font-weight: bold;
++            margin-left: 10px;
++        }
++        .safe-link {
++            color: #0066cc;
++            text-decoration: none;
++            margin-left: 10px;
++            font-size: 0.9em;
++        }
++        .safe-link:hover {
++            text-decoration: underline;
++        }
++        .copy-btn {
++            background-color: #f0f0f0;
++            border: 1px solid #ccc;
++            border-radius: 3px;
++            padding: 2px 8px;
++            margin-left: 8px;
++            cursor: pointer;
++            font-size: 0.85em;
++            color: #666;
++        }
++        .copy-btn:hover {
++            background-color: #e0e0e0;
++            color: #333;
++        }
++        .copy-btn:active {
++            background-color: #d0d0d0;
++        }
++        .address-container {
++            display: flex;
++            align-items: center;
++            gap: 5px;
++        }
++        .safe-name {
++            color: #0066cc;
++            font-weight: bold;
++            margin-left: 5px;
++        }
++    </style>
+ </head>
+ <body>
+     <h1>Safe Multisig Lookup</h1>
+     <form id="lookupForm">
+-        <input type="text" id="addressInput" placeholder="Enter wallet address (0x...)" required style="width: 400px; padding: 8px;">
+-        <button type="submit" id="submitBtn">Lookup</button>
++        <div class="lookup-type">
++            <label>
++                <input type="radio" name="lookupType" value="owner" checked>
++                Find Safes by Owner Address
++            </label>
++            <label>
++                <input type="radio" name="lookupType" value="safe">
++                Find Owners by Safe Address
++            </label>
++        </div>
++        <div>
++            <input type="text" id="addressInput" placeholder="Enter address (0x...)" required>
++        </div>
++        <div>
++            <button type="submit" id="submitBtn">Lookup</button>
++        </div>
+     </form>
+-    <div id="loading" style="display: none; margin-top: 20px;">Loading...</div>
+-    <div id="results" style="margin-top: 20px;"></div>
++    <div id="loading" style="display: none;">Loading...</div>
++    <div id="results"></div>
+ 
+     <script>
+         const form = document.getElementById('lookupForm');
+@@ -20,13 +132,69 @@
+         const submitBtn = document.getElementById('submitBtn');
+         const loading = document.getElementById('loading');
+         const results = document.getElementById('results');
++        const lookupTypeRadios = document.querySelectorAll('input[name="lookupType"]');
++
++        // Network to Safe app URL prefix mapping
++        const NETWORK_TO_SAFE_APP = {
++            ethereum: 'eth',
++            polygon: 'matic',
++            optimism: 'oeth',
++            bnb: 'bnb',
++            arbitrum: 'arb1',
++            gnosis: 'gno',
++            xlaychain: 'okb'
++        };
++
++        // Function to clear results
++        function clearResults() {
++            results.innerHTML = '';
++            loading.style.display = 'none';
++        }
++
++        // Function to copy address to clipboard (global for onclick)
++        window.copyToClipboard = function(text, event) {
++            navigator.clipboard.writeText(text).then(() => {
++                // Show temporary feedback
++                const btn = event.target;
++                const originalText = btn.textContent;
++                btn.textContent = 'Copied!';
++                btn.style.backgroundColor = '#4CAF50';
++                btn.style.color = 'white';
++                setTimeout(() => {
++                    btn.textContent = originalText;
++                    btn.style.backgroundColor = '';
++                    btn.style.color = '';
++                }, 1000);
++            }).catch(err => {
++                console.error('Failed to copy:', err);
++                alert('Failed to copy address');
++            });
++        }
++
++        // Update placeholder and clear results when lookup type changes
++        lookupTypeRadios.forEach(radio => {
++            radio.addEventListener('change', () => {
++                if (radio.value === 'owner') {
++                    addressInput.placeholder = 'Enter owner wallet address (0x...)';
++                } else {
++                    addressInput.placeholder = 'Enter Safe address (0x...)';
++                }
++                clearResults();
++            });
++        });
++
++        // Clear results when address input changes
++        addressInput.addEventListener('input', () => {
++            clearResults();
++        });
+ 
+         form.addEventListener('submit', async (e) => {
+             e.preventDefault();
+             const address = addressInput.value.trim();
++            const lookupType = document.querySelector('input[name="lookupType"]:checked').value;
+             
+             if (!address) {
+-                alert('Please enter a wallet address');
++                alert('Please enter an address');
+                 return;
+             }
+ 
+@@ -36,7 +204,8 @@
+             submitBtn.disabled = true;
+ 
+             try {
+-                const response = await fetch(`/api/lookup?address=${encodeURIComponent(address)}`);
++                const url = `/api/lookup?address=${encodeURIComponent(address)}&type=${lookupType}`;
++                const response = await fetch(url);
+                 const data = await response.json();
+ 
+                 if (!response.ok) {
+@@ -44,19 +213,54 @@
+                 }
+ 
+                 // Display results
+-                if (Object.keys(data.safes).length === 0) {
+-                    results.innerHTML = '<p>No Safe multisigs found for this address.</p>';
++                if (lookupType === 'owner') {
++                    // Owner lookup - show Safe addresses with threshold
++                    if (Object.keys(data.safes || {}).length === 0) {
++                        results.innerHTML = '<p>No Safe multisigs found for this owner address.</p>';
++                    } else {
++                        let html = '<h2>Safe Multisigs Found:</h2>';
++                        for (const [network, safeList] of Object.entries(data.safes)) {
++                            html += `<h3>${network.toUpperCase()}</h3>`;
++                            html += '<ul>';
++                            safeList.forEach((safe) => {
++                                const safeAppUrl = `https://app.safe.global/home?safe=${NETWORK_TO_SAFE_APP[network]}:${safe.address}`;
++                                const nameDisplay = safe.name ? `<span class="safe-name">(${safe.name})</span>` : '';
++                                html += `<li class="address-container">`;
++                                html += `<a href="${safeAppUrl}" target="_blank" class="safe-link">${safe.address}</a>`;
++                                html += `<span class="threshold">(Threshold: ${safe.threshold}/${safe.totalOwners})</span>`;
++                                html += nameDisplay;
++                                html += `</li>`;
++                            });
++                            html += '</ul>';
++                        }
++                        results.innerHTML = html;
++                    }
+                 } else {
+-                    let html = '<h2>Results:</h2>';
+-                    for (const [network, safeList] of Object.entries(data.safes)) {
+-                        html += `<h3>${network.toUpperCase()}</h3>`;
+-                        html += '<ul>';
+-                        safeList.forEach((safe) => {
+-                            html += `<li>${safe}</li>`;
+-                        });
+-                        html += '</ul>';
++                    // Safe lookup - show owners with names and threshold
++                    if (Object.keys(data.owners || {}).length === 0) {
++                        results.innerHTML = '<p>No owners found for this Safe address on any network.</p>';
++                    } else {
++                        let html = '<h2>Owners Found:</h2>';
++                        for (const [network, safeData] of Object.entries(data.owners)) {
++                            const safeNameDisplay = safeData.safeName 
++                                ? ` <span class="safe-name">(${safeData.safeName})</span>` 
++                                : '';
++                            const safeAppUrl = `https://app.safe.global/home?safe=${NETWORK_TO_SAFE_APP[network]}:${safeData.safeAddress}`;
++                            html += `<h3>${network.toUpperCase()} - Safe: <a href="${safeAppUrl}" target="_blank" class="safe-link">${safeData.safeAddress}</a>${safeNameDisplay} <span class="threshold">(Threshold: ${safeData.threshold}/${safeData.owners.length})</span></h3>`;
++                            html += '<ul>';
++                            safeData.owners.forEach((owner) => {
++                                const nameDisplay = owner.name 
++                                    ? ` <span class="owner-name">(${owner.name})</span>` 
++                                    : '';
++                                html += `<li class="address-container">`;
++                                html += `<span>${owner.address}${nameDisplay}</span>`;
++                                html += `<button class="copy-btn" onclick="copyToClipboard('${owner.address}', event)">Copy</button>`;
++                                html += `</li>`;
++                            });
++                            html += '</ul>';
++                        }
++                        results.innerHTML = html;
+                     }
+-                    results.innerHTML = html;
+                 }
+             } catch (error) {
+                 results.innerHTML = `<p style="color: red;">Error: ${error.message}</p>`;
+diff --git a/safe-address-book-2026-01-13.csv b/safe-address-book-2026-01-13.csv
+new file mode 100644
+index 0000000..157e86f
+--- /dev/null
++++ b/safe-address-book-2026-01-13.csv
+@@ -0,0 +1,103 @@
++address,name,chainId
++0x4E5d582507217E17c36e474fc73b3B25539B3BCF,Whimsical Ethereum Safe,1
++0x1536dBbF79Fb529CD14eCae2D7B0Fb5c88642487,Splendid Ethereum Safe,1
++0xAAfb31780e4b9c95Bc920e388f4925A874cd07AF,ETHx Manager,1
++0x91B4139A2FAeaCD4CdbFc3F7B1663F91a54be237,MaticX external multisig,1
++0x08F21e00D9eE3D082cC2a7CcC9C2a5770666e7c2,Stakin,1
++0xEf781De8c56775e60e07b0a0c6a78a5E82C8AfF0,Karan,1
++0xeCbb058Fc429941124a2b8d0984354c3132F536f,Yorick,1
++0xc6160F5bC3C673AC390f11c492E8ED0d0693579A,Dheeraj,1
++0xA6ed1C21933791179c469a830f641341B7c42E48,Stakely Paco Bits,1
++0x278f9565e8f4d12a011C3A9B6c81ccE916c626ED,Richard Galvin,1
++0x51C59785639CCa31c09D0833749e76A5D945C9F3,Timo,1
++0x0e4B97563723eF7f0a7FDe4c7bD3B17a5bF63fBf,Manoj,1
++0xFCc1C98F887C93C38Deb5e38A6Fb820AD3fB9DFD,Mihailo,1
++0xCbcdd778AA25476F203814214dD3E9b9c46829A1,Kelp Manager,1
++0x86CbBAEB08861D005fD2147A5123E43e558db167,Punit,1
++0x68258012DA3B933a81617FD08c9382a60B87cA98,Kranthi,1
++0x374aC9Ef5aA496440A5b3A3D3ABb9Dece7400d89,Manoj,1
++0xCB7B385313FeA5120B40b9171c912701112C328f,Vidhu,1
++0x746d6a9f789999799AE7f5d62Aa70422F86826b6,Amit,1
++0x7AAd74b7f0d60D5867B59dbD377a71783425af47,Dheeraj,1
++0x1f7A03b70C5448DFd0a2C5a7865169253c2C769b,Gus,1
++0x601767c4ba4134cc2E906ea7cf25EaB845152A7C,Sid,1
++0xd5b1321b5BCcD0878B50c385e04a42a990Ae9c2F,Stader Ops wallet,1
++0xB8ffAd4020c76F9fE9b49c68B417FD8Cb4C20516,Saurabh Analytics,1
++0x488C187AeEd0e6635a981ECEe574FB4aD941C3C5,MaticX Recovery Safe,1
++0xDf83E84F1eB00F0230eB912E2Ec823C979800B1c,Rajath,1
++0x75db63125A4f04E59A1A2Ab4aCC4FC1Cd5Daddd5,Dheeraj,1
++0xd9BA47739E6Cb24bd4B670e32cb1440e082688D1,Accel,1
++0xe736dFd4659eE4793E509F7c3A4448B2b3148f02,CA Aishwary,1
++0x80A43dd35382C4919991C5Bca7f46Dd24Fde4C67,MaticX internal multisig,1
++0x86CbBAEB08861D005fD2147A5123E43e558db167,Punit,10
++0x601767c4ba4134cc2E906ea7cf25EaB845152A7C,Sid,10
++0x1f7A03b70C5448DFd0a2C5a7865169253c2C769b,Gus,10
++0x7AAd74b7f0d60D5867B59dbD377a71783425af47,Dheeraj,10
++0xc6160F5bC3C673AC390f11c492E8ED0d0693579A,Dheeraj,10
++0xcF00878198d8480bB3E4B784Af58D7Cb18Aa2037,Dulgunn,10
++0x0e4B97563723eF7f0a7FDe4c7bD3B17a5bF63fBf,Manoj,10
++0x68258012DA3B933a81617FD08c9382a60B87cA98,Kranthi,10
++0xDf83E84F1eB00F0230eB912E2Ec823C979800B1c,Rajath,10
++0xB8ffAd4020c76F9fE9b49c68B417FD8Cb4C20516,Saurabh,10
++0xb866E12b414d9f975034C4BA51498E6E64559a4c,Glorious BNB Chain Safe,56
++0x79A2Ae748AC8bE4118B7a8096681B30310c3adBE,BNBx Manager Role,56
++0x0e4B97563723eF7f0a7FDe4c7bD3B17a5bF63fBf,Manoj,56
++0xc6160F5bC3C673AC390f11c492E8ED0d0693579A,Dheeraj,56
++0x86CbBAEB08861D005fD2147A5123E43e558db167,Punit,56
++0x68258012DA3B933a81617FD08c9382a60B87cA98,Kranthi,56
++0x601767c4ba4134cc2E906ea7cf25EaB845152A7C,Sid,56
++0xF0CC0353004560Afe58751e3F088951b06ac7997,Advay,56
++0x7AAd74b7f0d60D5867B59dbD377a71783425af47,Dheeraj,56
++0xa9De8755FaCD88Fd82894afD2C014C860993042f,Emanuel,56
++0x746d6a9f789999799AE7f5d62Aa70422F86826b6,Amit,56
++0x75db63125A4f04E59A1A2Ab4aCC4FC1Cd5Daddd5,Dheeraj,56
++0xcF00878198d8480bB3E4B784Af58D7Cb18Aa2037,Dulgunn,56
++0x3e75d48e138fC49e382C5a223D5eA5eae374b394,Aditya Krishnakumar,56
++0x1f7A03b70C5448DFd0a2C5a7865169253c2C769b,Gus,56
++0x82C4b61923029BF65e1083Fd556246f567D5c7cC,John Cairns,56
++0x61f45F63e06aa0DAE039BcFDa2c4Aab017441Ee7,Mike,56
++0x7Da5A697980E53Ecc137c0f7E96F4Cb656130098,Amrit,56
++0x2198A3188A0dc5526567A5D17b06e466C042D702,Lars,56
++0x956764BAd3aDf4e5a1DAFf3B68343a845B3fE45C,Hasan,56
++0x592942c2E3e602acc1c72A1753259f0bcb2eB580,Rahul,56
++0xDf83E84F1eB00F0230eB912E2Ec823C979800B1c,Rajath,56
++0x86CbBAEB08861D005fD2147A5123E43e558db167,Punit,100
++0xcF00878198d8480bB3E4B784Af58D7Cb18Aa2037,Dulgunn,100
++0xc6160F5bC3C673AC390f11c492E8ED0d0693579A,Dheeraj,100
++0x374aC9Ef5aA496440A5b3A3D3ABb9Dece7400d89,Manoj,100
++0x82C4b61923029BF65e1083Fd556246f567D5c7cC,John Cairns,100
++0xc6160F5bC3C673AC390f11c492E8ED0d0693579A,Dheeraj,137
++0x8E0a538081BA1d7f41b7c594F0a2Afe7aE558494,Dheeraj,137
++0x68258012DA3B933a81617FD08c9382a60B87cA98,Kranthi,137
++0x75db63125A4f04E59A1A2Ab4aCC4FC1Cd5Daddd5,Dheeraj,137
++0x601767c4ba4134cc2E906ea7cf25EaB845152A7C,Sid,137
++0xcF00878198d8480bB3E4B784Af58D7Cb18Aa2037,Dulguun,137
++0x488C187AeEd0e6635a981ECEe574FB4aD941C3C5,MaticX Recovery Safe,137
++0x0e4B97563723eF7f0a7FDe4c7bD3B17a5bF63fBf,Manoj,137
++0xbc9BFD8Ee2aAa54E672F98A53B1536E0b3092f87,Pratik Nikam,137
++0x86CbBAEB08861D005fD2147A5123E43e558db167,Punit,137
++0x86CbBAEB08861D005fD2147A5123E43e558db167,Punit,196
++0xcF00878198d8480bB3E4B784Af58D7Cb18Aa2037,Dulgunn,196
++0xc6160F5bC3C673AC390f11c492E8ED0d0693579A,Dheeraj,196
++0x374aC9Ef5aA496440A5b3A3D3ABb9Dece7400d89,Manoj,196
++0x2E1F5C7f87096fb7FfFbB6654Fc3b2CE303aEff5,John,196
++0x86CbBAEB08861D005fD2147A5123E43e558db167,Punit Jain,1101
++0x7AAd74b7f0d60D5867B59dbD377a71783425af47,Dheeraj,1101
++0x1f7A03b70C5448DFd0a2C5a7865169253c2C769b,Gus,1101
++0x68258012DA3B933a81617FD08c9382a60B87cA98,Kranthi,1101
++0xe85F0d083D0CD18485E531c1A8B8a05ad2C0308f,Superior Arbitrum Safe,42161
++0xcF00878198d8480bB3E4B784Af58D7Cb18Aa2037,Dulgunn,42161
++0x86CbBAEB08861D005fD2147A5123E43e558db167,Punit Jain,42161
++0xc6160F5bC3C673AC390f11c492E8ED0d0693579A,Dheeraj,42161
++0x601767c4ba4134cc2E906ea7cf25EaB845152A7C,Sid,42161
++0x0e4B97563723eF7f0a7FDe4c7bD3B17a5bF63fBf,Manoj,42161
++0x68258012DA3B933a81617FD08c9382a60B87cA98,Kranthi,42161
++0xF0CC0353004560Afe58751e3F088951b06ac7997,Advay,42161
++0x86CbBAEB08861D005fD2147A5123E43e558db167,Punit,43114
++0x1f7A03b70C5448DFd0a2C5a7865169253c2C769b,Gus,43114
++0x7AAd74b7f0d60D5867B59dbD377a71783425af47,Dheeraj,43114
++0xFCc1C98F887C93C38Deb5e38A6Fb820AD3fB9DFD,Mihailo,43114
++0x51C59785639CCa31c09D0833749e76A5D945C9F3,Timo,43114
++0x746d6a9f789999799AE7f5d62Aa70422F86826b6,Amit,43114
++0xDf83E84F1eB00F0230eB912E2Ec823C979800B1c,Rajath,43114
++0x86CbBAEB08861D005fD2147A5123E43e558db167,Punit,11155111
+\ No newline at end of file
+diff --git a/safe-address-book-2026-01-13.ts b/safe-address-book-2026-01-13.ts
+new file mode 100644
+index 0000000..98f2e5f
+--- /dev/null
++++ b/safe-address-book-2026-01-13.ts
+@@ -0,0 +1,123 @@
++
++// AUTO-GENERATED FILE — DO NOT EDIT
++
++export type AddressBookEntry = {
++  address: string;
++  name: string;
++  chainId: number;
++};
++
++export const ADDRESS_BOOK: AddressBookEntry[] = [
++  { address: "0x4E5d582507217E17c36e474fc73b3B25539B3BCF", name: "Whimsical Ethereum Safe", chainId: 1 },
++  { address: "0x1536dBbF79Fb529CD14eCae2D7B0Fb5c88642487", name: "Splendid Ethereum Safe", chainId: 1 },
++  { address: "0xAAfb31780e4b9c95Bc920e388f4925A874cd07AF", name: "ETHx Manager", chainId: 1 },
++  { address: "0x91B4139A2FAeaCD4CdbFc3F7B1663F91a54be237", name: "MaticX external multisig", chainId: 1 },
++  { address: "0x08F21e00D9eE3D082cC2a7CcC9C2a5770666e7c2", name: "Stakin", chainId: 1 },
++  { address: "0xEf781De8c56775e60e07b0a0c6a78a5E82C8AfF0", name: "Karan", chainId: 1 },
++  { address: "0xeCbb058Fc429941124a2b8d0984354c3132F536f", name: "Yorick", chainId: 1 },
++  { address: "0xc6160F5bC3C673AC390f11c492E8ED0d0693579A", name: "Dheeraj", chainId: 1 },
++  { address: "0xA6ed1C21933791179c469a830f641341B7c42E48", name: "Stakely Paco Bits", chainId: 1 },
++  { address: "0x278f9565e8f4d12a011C3A9B6c81ccE916c626ED", name: "Richard Galvin", chainId: 1 },
++  { address: "0x51C59785639CCa31c09D0833749e76A5D945C9F3", name: "Timo", chainId: 1 },
++  { address: "0x0e4B97563723eF7f0a7FDe4c7bD3B17a5bF63fBf", name: "Manoj", chainId: 1 },
++  { address: "0xFCc1C98F887C93C38Deb5e38A6Fb820AD3fB9DFD", name: "Mihailo", chainId: 1 },
++  { address: "0xCbcdd778AA25476F203814214dD3E9b9c46829A1", name: "Kelp Manager", chainId: 1 },
++  { address: "0x86CbBAEB08861D005fD2147A5123E43e558db167", name: "Punit", chainId: 1 },
++  { address: "0x68258012DA3B933a81617FD08c9382a60B87cA98", name: "Kranthi", chainId: 1 },
++  { address: "0x374aC9Ef5aA496440A5b3A3D3ABb9Dece7400d89", name: "Manoj", chainId: 1 },
++  { address: "0xCB7B385313FeA5120B40b9171c912701112C328f", name: "Vidhu", chainId: 1 },
++  { address: "0x746d6a9f789999799AE7f5d62Aa70422F86826b6", name: "Amit", chainId: 1 },
++  { address: "0x7AAd74b7f0d60D5867B59dbD377a71783425af47", name: "Dheeraj", chainId: 1 },
++  { address: "0x1f7A03b70C5448DFd0a2C5a7865169253c2C769b", name: "Gus", chainId: 1 },
++  { address: "0x601767c4ba4134cc2E906ea7cf25EaB845152A7C", name: "Sid", chainId: 1 },
++  { address: "0xd5b1321b5BCcD0878B50c385e04a42a990Ae9c2F", name: "Stader Ops wallet", chainId: 1 },
++  { address: "0xB8ffAd4020c76F9fE9b49c68B417FD8Cb4C20516", name: "Saurabh Analytics", chainId: 1 },
++  { address: "0x488C187AeEd0e6635a981ECEe574FB4aD941C3C5", name: "MaticX Recovery Safe", chainId: 1 },
++  { address: "0xDf83E84F1eB00F0230eB912E2Ec823C979800B1c", name: "Rajath", chainId: 1 },
++  { address: "0x75db63125A4f04E59A1A2Ab4aCC4FC1Cd5Daddd5", name: "Dheeraj", chainId: 1 },
++  { address: "0xd9BA47739E6Cb24bd4B670e32cb1440e082688D1", name: "Accel", chainId: 1 },
++  { address: "0xe736dFd4659eE4793E509F7c3A4448B2b3148f02", name: "CA Aishwary", chainId: 1 },
++  { address: "0x80A43dd35382C4919991C5Bca7f46Dd24Fde4C67", name: "MaticX internal multisig", chainId: 1 },
++  { address: "0x86CbBAEB08861D005fD2147A5123E43e558db167", name: "Punit", chainId: 10 },
++  { address: "0x601767c4ba4134cc2E906ea7cf25EaB845152A7C", name: "Sid", chainId: 10 },
++  { address: "0x1f7A03b70C5448DFd0a2C5a7865169253c2C769b", name: "Gus", chainId: 10 },
++  { address: "0x7AAd74b7f0d60D5867B59dbD377a71783425af47", name: "Dheeraj", chainId: 10 },
++  { address: "0xc6160F5bC3C673AC390f11c492E8ED0d0693579A", name: "Dheeraj", chainId: 10 },
++  { address: "0xcF00878198d8480bB3E4B784Af58D7Cb18Aa2037", name: "Dulgunn", chainId: 10 },
++  { address: "0x0e4B97563723eF7f0a7FDe4c7bD3B17a5bF63fBf", name: "Manoj", chainId: 10 },
++  { address: "0x68258012DA3B933a81617FD08c9382a60B87cA98", name: "Kranthi", chainId: 10 },
++  { address: "0xDf83E84F1eB00F0230eB912E2Ec823C979800B1c", name: "Rajath", chainId: 10 },
++  { address: "0xB8ffAd4020c76F9fE9b49c68B417FD8Cb4C20516", name: "Saurabh", chainId: 10 },
++  { address: "0xb866E12b414d9f975034C4BA51498E6E64559a4c", name: "Glorious BNB Chain Safe", chainId: 56 },
++  { address: "0x79A2Ae748AC8bE4118B7a8096681B30310c3adBE", name: "BNBx Manager Role", chainId: 56 },
++  { address: "0x0e4B97563723eF7f0a7FDe4c7bD3B17a5bF63fBf", name: "Manoj", chainId: 56 },
++  { address: "0xc6160F5bC3C673AC390f11c492E8ED0d0693579A", name: "Dheeraj", chainId: 56 },
++  { address: "0x86CbBAEB08861D005fD2147A5123E43e558db167", name: "Punit", chainId: 56 },
++  { address: "0x68258012DA3B933a81617FD08c9382a60B87cA98", name: "Kranthi", chainId: 56 },
++  { address: "0x601767c4ba4134cc2E906ea7cf25EaB845152A7C", name: "Sid", chainId: 56 },
++  { address: "0xF0CC0353004560Afe58751e3F088951b06ac7997", name: "Advay", chainId: 56 },
++  { address: "0x7AAd74b7f0d60D5867B59dbD377a71783425af47", name: "Dheeraj", chainId: 56 },
++  { address: "0xa9De8755FaCD88Fd82894afD2C014C860993042f", name: "Emanuel", chainId: 56 },
++  { address: "0x746d6a9f789999799AE7f5d62Aa70422F86826b6", name: "Amit", chainId: 56 },
++  { address: "0x75db63125A4f04E59A1A2Ab4aCC4FC1Cd5Daddd5", name: "Dheeraj", chainId: 56 },
++  { address: "0xcF00878198d8480bB3E4B784Af58D7Cb18Aa2037", name: "Dulgunn", chainId: 56 },
++  { address: "0x3e75d48e138fC49e382C5a223D5eA5eae374b394", name: "Aditya Krishnakumar", chainId: 56 },
++  { address: "0x1f7A03b70C5448DFd0a2C5a7865169253c2C769b", name: "Gus", chainId: 56 },
++  { address: "0x82C4b61923029BF65e1083Fd556246f567D5c7cC", name: "John Cairns", chainId: 56 },
++  { address: "0x61f45F63e06aa0DAE039BcFDa2c4Aab017441Ee7", name: "Mike", chainId: 56 },
++  { address: "0x7Da5A697980E53Ecc137c0f7E96F4Cb656130098", name: "Amrit", chainId: 56 },
++  { address: "0x2198A3188A0dc5526567A5D17b06e466C042D702", name: "Lars", chainId: 56 },
++  { address: "0x956764BAd3aDf4e5a1DAFf3B68343a845B3fE45C", name: "Hasan", chainId: 56 },
++  { address: "0x592942c2E3e602acc1c72A1753259f0bcb2eB580", name: "Rahul", chainId: 56 },
++  { address: "0xDf83E84F1eB00F0230eB912E2Ec823C979800B1c", name: "Rajath", chainId: 56 },
++  { address: "0x86CbBAEB08861D005fD2147A5123E43e558db167", name: "Punit", chainId: 100 },
++  { address: "0xcF00878198d8480bB3E4B784Af58D7Cb18Aa2037", name: "Dulgunn", chainId: 100 },
++  { address: "0xc6160F5bC3C673AC390f11c492E8ED0d0693579A", name: "Dheeraj", chainId: 100 },
++  { address: "0x374aC9Ef5aA496440A5b3A3D3ABb9Dece7400d89", name: "Manoj", chainId: 100 },
++  { address: "0x82C4b61923029BF65e1083Fd556246f567D5c7cC", name: "John Cairns", chainId: 100 },
++  { address: "0xc6160F5bC3C673AC390f11c492E8ED0d0693579A", name: "Dheeraj", chainId: 137 },
++  { address: "0x8E0a538081BA1d7f41b7c594F0a2Afe7aE558494", name: "Dheeraj", chainId: 137 },
++  { address: "0x68258012DA3B933a81617FD08c9382a60B87cA98", name: "Kranthi", chainId: 137 },
++  { address: "0x75db63125A4f04E59A1A2Ab4aCC4FC1Cd5Daddd5", name: "Dheeraj", chainId: 137 },
++  { address: "0x601767c4ba4134cc2E906ea7cf25EaB845152A7C", name: "Sid", chainId: 137 },
++  { address: "0xcF00878198d8480bB3E4B784Af58D7Cb18Aa2037", name: "Dulguun", chainId: 137 },
++  { address: "0x488C187AeEd0e6635a981ECEe574FB4aD941C3C5", name: "MaticX Recovery Safe", chainId: 137 },
++  { address: "0x0e4B97563723eF7f0a7FDe4c7bD3B17a5bF63fBf", name: "Manoj", chainId: 137 },
++  { address: "0xbc9BFD8Ee2aAa54E672F98A53B1536E0b3092f87", name: "Pratik Nikam", chainId: 137 },
++  { address: "0x86CbBAEB08861D005fD2147A5123E43e558db167", name: "Punit", chainId: 137 },
++  { address: "0x86CbBAEB08861D005fD2147A5123E43e558db167", name: "Punit", chainId: 196 },
++  { address: "0xcF00878198d8480bB3E4B784Af58D7Cb18Aa2037", name: "Dulgunn", chainId: 196 },
++  { address: "0xc6160F5bC3C673AC390f11c492E8ED0d0693579A", name: "Dheeraj", chainId: 196 },
++  { address: "0x374aC9Ef5aA496440A5b3A3D3ABb9Dece7400d89", name: "Manoj", chainId: 196 },
++  { address: "0x2E1F5C7f87096fb7FfFbB6654Fc3b2CE303aEff5", name: "John", chainId: 196 },
++  { address: "0x86CbBAEB08861D005fD2147A5123E43e558db167", name: "Punit Jain", chainId: 1101 },
++  { address: "0x7AAd74b7f0d60D5867B59dbD377a71783425af47", name: "Dheeraj", chainId: 1101 },
++  { address: "0x1f7A03b70C5448DFd0a2C5a7865169253c2C769b", name: "Gus", chainId: 1101 },
++  { address: "0x68258012DA3B933a81617FD08c9382a60B87cA98", name: "Kranthi", chainId: 1101 },
++  { address: "0xe85F0d083D0CD18485E531c1A8B8a05ad2C0308f", name: "Superior Arbitrum Safe", chainId: 42161 },
++  { address: "0xcF00878198d8480bB3E4B784Af58D7Cb18Aa2037", name: "Dulgunn", chainId: 42161 },
++  { address: "0x86CbBAEB08861D005fD2147A5123E43e558db167", name: "Punit Jain", chainId: 42161 },
++  { address: "0xc6160F5bC3C673AC390f11c492E8ED0d0693579A", name: "Dheeraj", chainId: 42161 },
++  { address: "0x601767c4ba4134cc2E906ea7cf25EaB845152A7C", name: "Sid", chainId: 42161 },
++  { address: "0x0e4B97563723eF7f0a7FDe4c7bD3B17a5bF63fBf", name: "Manoj", chainId: 42161 },
++  { address: "0x68258012DA3B933a81617FD08c9382a60B87cA98", name: "Kranthi", chainId: 42161 },
++  { address: "0xF0CC0353004560Afe58751e3F088951b06ac7997", name: "Advay", chainId: 42161 },
++  { address: "0x86CbBAEB08861D005fD2147A5123E43e558db167", name: "Punit", chainId: 43114 },
++  { address: "0x1f7A03b70C5448DFd0a2C5a7865169253c2C769b", name: "Gus", chainId: 43114 },
++  { address: "0x7AAd74b7f0d60D5867B59dbD377a71783425af47", name: "Dheeraj", chainId: 43114 },
++  { address: "0xFCc1C98F887C93C38Deb5e38A6Fb820AD3fB9DFD", name: "Mihailo", chainId: 43114 },
++  { address: "0x51C59785639CCa31c09D0833749e76A5D945C9F3", name: "Timo", chainId: 43114 },
++  { address: "0x746d6a9f789999799AE7f5d62Aa70422F86826b6", name: "Amit", chainId: 43114 },
++  { address: "0xDf83E84F1eB00F0230eB912E2Ec823C979800B1c", name: "Rajath", chainId: 43114 },
++  { address: "0x86CbBAEB08861D005fD2147A5123E43e558db167", name: "Punit", chainId: 11155111 },
++];
++
++export const ADDRESS_BOOK_INDEX: Record<number, Record<string, string>> = (() => {
++  const index: Record<number, Record<string, string>> = {};
++  for (const e of ADDRESS_BOOK) {
++    const addr = e.address.toLowerCase();
++    if (!index[e.chainId]) index[e.chainId] = {};
++    index[e.chainId][addr] = e.name;
++  }
++  return index;
++})();
+diff --git a/src/index.ts b/src/index.ts
+index 878a522..c7b1b1a 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -1,23 +1,28 @@
+ import axios from "axios";
+ import { getAddress } from "ethers";
+ import dotenv from "dotenv";
+-import { SAFE_NETWORKS } from "./networks";
+-import { OwnerSafesResponse } from "./types";
++import { SAFE_NETWORKS, NETWORK_TO_CHAIN_ID, NETWORK_TO_SAFE_APP } from "./networks";
++import { OwnerSafesResponse, SafeDetailsResponse, SafeWithThreshold, SafeOwnersWithThreshold } from "./types";
++import { ADDRESS_BOOK_INDEX } from "../safe-address-book-2026-01-13";
+ 
+ dotenv.config();
+ 
+ const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+ 
+-async function fetchWithRetry(
++async function fetchWithRetry<T>(
+   url: string,
+   headers: Record<string, string>,
+   maxRetries: number = 3
+-): Promise<OwnerSafesResponse> {
++): Promise<T> {
+   for (let attempt = 1; attempt <= maxRetries; attempt++) {
+     try {
+-      const response = await axios.get<OwnerSafesResponse>(url, { headers });
++      const response = await axios.get<T>(url, { headers });
+       return response.data;
+     } catch (error: any) {
++      // Don't retry on 404 - Safe/owner doesn't exist on this network
++      if (error.response?.status === 404) {
++        throw error;
++      }
+       if (attempt === maxRetries) {
+         throw error;
+       }
+@@ -29,7 +34,7 @@ async function fetchWithRetry(
+ 
+ async function getSafesByOwner(owner: string) {
+   const normalizedOwner = getAddress(owner);
+-  const result: Record<string, string[]> = {};
++  const result: Record<string, SafeWithThreshold[]> = {};
+   const apiKey = process.env.SAFE_API_KEY;
+ 
+   if (!apiKey) {
+@@ -39,42 +44,147 @@ async function getSafesByOwner(owner: string) {
+   for (const [network, baseUrl] of Object.entries(SAFE_NETWORKS)) {
+     try {
+       const url = `${baseUrl}/api/v2/owners/${normalizedOwner}/safes/`; 
+-      const data = await fetchWithRetry(url, {
++      const data = await fetchWithRetry<OwnerSafesResponse>(url, {
+         "Authorization": `Bearer ${apiKey}`
+       });
+ 
+       if (data.results && data.results.length > 0) {
+-        result[network] = data.results.map(safe => safe.address);
++        const chainId = NETWORK_TO_CHAIN_ID[network];
++        const addressBook = ADDRESS_BOOK_INDEX[chainId] || {};
++        
++        result[network] = data.results.map(safe => {
++          const normalizedSafe = safe.address.toLowerCase();
++          const safeName = addressBook[normalizedSafe] || null;
++          return {
++            address: safe.address,
++            threshold: safe.threshold,
++            totalOwners: safe.owners.length,
++            name: safeName
++          };
++        });
++      }
++    } catch (error: any) {
++      if (error.response?.status !== 404) {
++        console.error(`❌ ${network}: ${error.message}`);
++      }
++    }
++  }
++
++  return result;
++}
++
++async function getOwnersBySafe(safeAddress: string) {
++  const normalizedSafe = getAddress(safeAddress);
++  const result: Record<string, SafeOwnersWithThreshold> = {};
++  const apiKey = process.env.SAFE_API_KEY;
++
++  if (!apiKey) {
++    throw new Error("SAFE_API_KEY is not set in .env file");
++  }
++
++  const networks = Object.keys(SAFE_NETWORKS);
++  console.log(`\nSearching Safe ${normalizedSafe} across ${networks.length} networks: ${networks.join(', ')}\n`);
++
++  for (const [network, baseUrl] of Object.entries(SAFE_NETWORKS)) {
++    try {
++      process.stdout.write(`  Checking ${network}... `);
++      const url = `${baseUrl}/api/v1/safes/${normalizedSafe}/`;
++      const data = await fetchWithRetry<SafeDetailsResponse>(url, {
++        "Authorization": `Bearer ${apiKey}`
++      });
++
++      if (data.owners && data.owners.length > 0) {
++        console.log(`✓ Found ${data.owners.length} owner(s)`);
++        const chainId = NETWORK_TO_CHAIN_ID[network];
++        const addressBook = ADDRESS_BOOK_INDEX[chainId] || {};
++        
++        const normalizedSafeAddr = normalizedSafe.toLowerCase();
++        const safeName = addressBook[normalizedSafeAddr] || null;
++        
++        result[network] = {
++          safeAddress: normalizedSafe,
++          safeName: safeName,
++          threshold: data.threshold,
++          owners: data.owners.map(owner => {
++            const normalizedOwner = owner.toLowerCase();
++            const name = addressBook[normalizedOwner] || null;
++            return {
++              address: owner,
++              name: name
++            };
++          })
++        };
++      } else {
++        console.log(`- No owners found`);
+       }
+     } catch (error: any) {
+-      console.error(`❌ ${network}: ${error.message}`);
++      if (error.response?.status === 404) {
++        console.log(`- Not found (404)`);
++      } else {
++        console.log(`❌ ${error.message}`);
++      }
+     }
+   }
+ 
++  console.log(`\nSearch complete. Found on ${Object.keys(result).length} network(s).\n`);
+   return result;
+ }
+ 
+ // ---------- CLI usage ----------
+-const address = process.argv[2];
++const lookupType = process.argv[2];
++const address = process.argv[3];
+ 
+-if (!address) {
+-  console.error("❗ Usage: npx ts-node src/index.ts <wallet-address>");
++if (!lookupType || !address) {
++  console.error("❗ Usage:");
++  console.error("  Owner lookup: npx ts-node src/index.ts owner <wallet-address>");
++  console.error("  Safe lookup:  npx ts-node src/index.ts safe <safe-address>");
+   process.exit(1);
+ }
+ 
+ (async () => {
+-  console.log(`\n🔍 Scanning Safes for owner: ${address}\n`);
++  if (lookupType === 'safe') {
++    console.log(`\n🔍 Scanning owners for Safe: ${address}\n`);
+ 
+-  const safes = await getSafesByOwner(address);
++    const owners = await getOwnersBySafe(address);
+ 
+-  if (Object.keys(safes).length === 0) {
+-    console.log("No Safe multisigs found.");
+-    return;
+-  }
++    if (Object.keys(owners).length === 0) {
++      console.log("No owners found for this Safe address on any network.");
++      return;
++    }
+ 
+-  for (const [network, safeList] of Object.entries(safes)) {
+-    console.log(`🔗 ${network.toUpperCase()}`);
+-    safeList.forEach((safe) => console.log(`  - ${safe}`));
+-    console.log("");
++    for (const [network, safeData] of Object.entries(owners)) {
++      const safeNameDisplay = safeData.safeName ? ` | Name: ${safeData.safeName}` : '';
++      const safeAppUrl = `https://app.safe.global/home?safe=${NETWORK_TO_SAFE_APP[network]}:${safeData.safeAddress}`;
++      console.log(`🔗 ${network.toUpperCase()} - Safe: ${safeData.safeAddress} (Threshold: ${safeData.threshold}/${safeData.owners.length})${safeNameDisplay}`);
++      console.log(`    🔗 ${safeAppUrl}`);
++      safeData.owners.forEach((owner) => {
++        const nameDisplay = owner.name ? ` | Name: ${owner.name}` : '';
++        console.log(`  - ${owner.address}${nameDisplay}`);
++      });
++      console.log("");
++    }
++  } else if (lookupType === 'owner') {
++    console.log(`\n🔍 Scanning Safes for owner: ${address}\n`);
++
++    const safes = await getSafesByOwner(address);
++
++    if (Object.keys(safes).length === 0) {
++      console.log("No Safe multisigs found.");
++      return;
++    }
++
++    for (const [network, safeList] of Object.entries(safes)) {
++      console.log(`🔗 ${network.toUpperCase()}`);
++      safeList.forEach((safe) => {
++        const safeAppUrl = `https://app.safe.global/home?safe=${NETWORK_TO_SAFE_APP[network]}:${safe.address}`;
++        const nameDisplay = safe.name ? ` (${safe.name})` : '';
++        console.log(`  - ${safe.address} (Threshold: ${safe.threshold}/${safe.totalOwners})${nameDisplay}`);
++        console.log(`    🔗 ${safeAppUrl}`);
++      });
++      console.log("");
++    }
++  } else {
++    console.error("❗ Invalid lookup type. Use 'owner' or 'safe'");
++    process.exit(1);
+   }
+ })();
+diff --git a/src/networks.ts b/src/networks.ts
+index 2cc7e14..d866d7b 100644
+--- a/src/networks.ts
++++ b/src/networks.ts
+@@ -7,4 +7,26 @@ export const SAFE_NETWORKS: Record<string, string> = {
+     gnosis: "https://api.safe.global/tx-service/gno",
+     xlaychain: "https://api.safe.global/tx-service/okb",
+   };
++
++// Mapping from network name to chainId
++export const NETWORK_TO_CHAIN_ID: Record<string, number> = {
++    ethereum: 1,
++    polygon: 137,
++    optimism: 10,
++    bnb: 56,
++    arbitrum: 42161,
++    gnosis: 100,
++    xlaychain: 196,
++  };
++
++// Mapping from network name to Safe app URL prefix
++export const NETWORK_TO_SAFE_APP: Record<string, string> = {
++    ethereum: "eth",
++    polygon: "matic",
++    optimism: "oeth",
++    bnb: "bnb",
++    arbitrum: "arb1",
++    gnosis: "gno",
++    xlaychain: "okb",
++  };
+   
+\ No newline at end of file
+diff --git a/src/types.ts b/src/types.ts
+index a25f19b..c67644c 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -14,4 +14,35 @@ export interface OwnerSafesResponse {
+   next: string | null;
+   previous: string | null;
+   results: SafeInfo[];
++}
++
++export interface SafeDetailsResponse {
++  address: string;
++  nonce: number;
++  threshold: number;
++  owners: string[];
++  masterCopy: string;
++  modules: string[];
++  fallbackHandler: string;
++  guard: string | null;
++  version: string;
++}
++
++export interface OwnerWithName {
++  address: string;
++  name: string | null;
++}
++
++export interface SafeWithThreshold {
++  address: string;
++  threshold: number;
++  totalOwners: number;
++  name: string | null;
++}
++
++export interface SafeOwnersWithThreshold {
++  safeAddress: string;
++  safeName: string | null;
++  owners: OwnerWithName[];
++  threshold: number;
+ }
+\ No newline at end of file

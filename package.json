@@ -14,10 +14,12 @@
   "version": "1.0.0",
   "main": "dist/index.js",
   "scripts": {
-    "build": "mkdir -p public && echo 'Build complete - static files in public/'",
+    "build": "mkdir -p public && [ -f public/index.html ] && echo '✓ public/index.html exists' || (echo '✗ public/index.html missing' && exit 1)",
     "build:cli": "tsc",
     "start": "node dist/index.js",
-    "dev": "ts-node src/index.ts"
+    "dev": "ts-node src/index.ts",
+    "dev:server": "vercel dev",
+    "dev:static": "npx http-server . -p 3000 -o"
   },
   "keywords": [],
   "author": "",

@@ -1,11 +1,13 @@
 # Safe Multisig Lookup
 
-A simple tool to lookup Safe multisig wallets by owner address across multiple networks.
+A tool to lookup Safe multisig wallets and their owners across multiple networks.
 
 ## Features
 
-- Lookup Safe multisigs across Ethereum, Polygon, Arbitrum, Optimism, Base, Gnosis, and BNB networks
-- Simple web interface
+- **Owner Lookup**: Find all Safe multisigs where a given address is an owner
+- **Safe Lookup**: Find all owners of a given Safe address with name mapping from address book
+- Supports Ethereum, Polygon, Arbitrum, Optimism, BNB, Gnosis, and xLayer Chain networks
+- Simple web interface with toggle between lookup modes
 - CLI tool for command-line usage
 
 ## Local Development
@@ -29,7 +31,11 @@ SAFE_API_KEY=your_api_key_here
 
 3. Run the CLI tool:
 ```bash
-npm run dev <wallet-address>
+# Owner lookup - find all Safes owned by an address
+npm run dev owner <wallet-address>
+
+# Safe lookup - find all owners of a Safe address
+npm run dev safe <safe-address>
 ```
 
 ## Deployment to Vercel
